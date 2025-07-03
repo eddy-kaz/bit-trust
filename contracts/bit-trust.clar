@@ -436,3 +436,131 @@
     (/ (* amount collateral-ratio) u100)
   )
 )
+
+;; Credit-based interest rate optimization
+;; Rewards creditworthy borrowers with premium rates
+(define-private (calculate-interest-rate (score uint))
+  (let ((base-rate u10))
+    (- base-rate (/ (* score u5) u100))
+  )
+)
+
+;; Comprehensive debt calculation including accrued interest
+(define-private (calculate-total-due (loan {
+  borrower: principal,
+  amount: uint,
+  collateral: uint,
+  due-height: uint,
+  interest-rate: uint,
+  is-active: bool,
+  is-defaulted: bool,
+  repaid-amount: uint,
+}))
+  (let ((interest (* (get amount loan) (get interest-rate loan))))
+    (+ (get amount loan) (/ interest u100))
+  )
+)
+
+;; Adaptive credit scoring algorithm
+;; Rewards successful repayments, penalizes defaults
+(define-private (update-credit-score
+    (user principal)
+    (success bool)
+    (loan {
+      borrower: principal,
+      amount: uint,
+      collateral: uint,
+      due-height: uint,
+      interest-rate: uint,
+      is-active: bool,
+      is-defaulted: bool,
+      repaid-amount: uint,
+    })
+  )
+  (let (
+      (current-score (unwrap! (map-get? UserScores { user: user }) ERR-UNAUTHORIZED))
+      (new-score (if success
+        (if (<= (+ (get score current-score) u2) MAX-SCORE)
+          (+ (get score current-score) u2)
+          MAX-SCORE
+        )
+        (if (>= (- (get score current-score) u10) MIN-SCORE)
+          (- (get score current-score) u10)
+          MIN-SCORE
+        )
+      ))
+    )
+    ;; Update comprehensive user profile
+    (if success
+      (map-set UserScores { user: user }
+        (merge current-score {
+          score: new-score,
+          total-repaid: (+ (get total-repaid current-score) (get amount loan)),
+          loans-repaid: (+ (get loans-repaid current-score) u1),
+          last-update: stacks-block-height,
+        })
+      )
+      (map-set UserScores { user: user }
+        (merge current-score {
+          score: new-score,
+          last-update: stacks-block-height,
+        })
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Portfolio management for active loan tracking
+(define-private (update-user-loans
+    (user principal)
+    (loan-id uint)
+  )
+  (let ((user-loans (default-to { active-loans: (list) } (map-get? UserLoans { user: user }))))
+    (map-set UserLoans { user: user } { active-loans: (unwrap! (as-max-len? (append (get active-loans user-loans) loan-id) u20)
+      ERR-ACTIVE-LOAN
+    ) }
+    )
+    (ok true)
+  )
+)
+
+;; PUBLIC READ-ONLY FUNCTIONS
+
+;; Retrieve comprehensive user credit profile
+(define-read-only (get-user-score (user principal))
+  (map-get? UserScores { user: user })
+)
+
+;; Access detailed loan information
+(define-read-only (get-loan (loan-id uint))
+  (map-get? Loans { loan-id: loan-id })
+)
+
+;; View user's active loan portfolio
+(define-read-only (get-user-active-loans (user principal))
+  (map-get? UserLoans { user: user })
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Default management for overdue loans
+;; Maintains protocol security through automated risk management
+(define-public (mark-loan-defaulted (loan-id uint))
+  (let ((loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get due-height loan)) ERR-NOT-DUE)
+    (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+    (asserts! (<= loan-id (var-get next-loan-id)) ERR-INVALID-LOAN-ID)
+    ;; Execute default procedures
+    (map-set Loans { loan-id: loan-id }
+      (merge loan {
+        is-defaulted: true,
+        is-active: false,
+      })
+    )
+    ;; Apply credit score penalty
+    (try! (update-credit-score (get borrower loan) false loan))
+    (ok true)
+  )
+)
